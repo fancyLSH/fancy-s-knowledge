@@ -1,0 +1,145 @@
+Handler内存泄漏的原因：
+
+内部类持有外部类的引用，handler是匿名内部类，持有对this（所在的activity）的引用
+
+而其他内部类比如ViewHolder没有说过这个问题是因为他们不存在内部类持有外部类的引用的同时这个内部类也被其他锁持有。但是对于handler的话，内存泄漏的真正原因在于messagequeue持有message，而message又持有handler，handler有持有activity，所以即使调用了activity的destroy（）方法，由于message没有释放handler， 那还是无效的。其他内部类因为没有被别的东西所持有，所以是不会发生内存泄漏的。
+
+常用解决方法：软引用+static 把handler变成静态的。
+
+
+
+Looper的使用：
+
+必须先prepare（）Looper初始化，然后loop（），得先让Looper的机制滚动起来，不然messagequeue运转不起来。所以所有的执行必须先prepare（），然后再loop（）。但主线程不需要，因为主线程启动时，系统在mian（）函数中已经帮我们完成了，主线程中所有的代码都运行在prepare（）和loop（）这两个函数之间。 主线程之所以可以直接new handler是因为在main（）中（main函数是整个程序最先执行的函数）已经prepare（）和loop（）了。应用的管理（AMS）是以ActivityThread.java为中心的。
+
+那如果要在子线程中new handler，就必须进行一个Looper的prepare（）和loop（）还有quit（），quit（）是为了在消息队列无消息时安全结束子线程，不然的话会一直阻塞，什么事情也干不了。
+
+主线程时不允许调用quit（）函数的，调用了也会抛出异常。
+
+
+
+子线程中维护的Looper，消息队列无消息是的处理方案是什么？有什么用？
+
+子线程会调用quitSafely（）方法：
+
+（1）. 清除掉队列里的所有消息，释放内存；
+
+（2）. 释放线程；
+
+
+
+  既然可以存在多个Handler往MessageQueue中添加数据（发消息时各个Handler可能处于不同线程），那它内部时如何确保线程安全的？
+
+messgaequeue的enqueueumessage（）方法和loop（）方法中嗲用的next（）方法中都用到了synchronized来保证多线程的并发执行，避免队列产生混乱。
+
+但是用了synchronized锁后，handler的delay的消息就只能保持相对的准确了，而非绝对准确。因为加锁后其他线程需要等待释放锁。
+
+这个问题面试官还会顺着考查synchronized不同使用场景时的区别。
+
+synchronized：方法、静态方法、代码块（object）、代码块（this）。
+
+![image-20211011145448756](C:\Users\lenovo\AppData\Roaming\Typora\typora-user-images\image-20211011145448756.png)
+
+
+
+
+
+
+
+
+
+notify（）和notifyall（）方法如果在synchronized代码块中实际上是要先执行完代码块中的内容才会运行他们锁唤醒的线程，所以它们卸载代码块的第一行还是最后一行都是一样的效果，作用就是先将索要唤醒的线程处于就绪态，等代码块中的代码都运行完后再执行唤醒的线程。
+
+
+
+wait（）方法除了会释放锁之外，还会释放线程，让它去处理其他的事情；而sleep（）方法不会释放锁，且会让线程进入休眠状态，直到被唤醒。
+
+
+
+消息队列为空时，怎么处理？
+
+消息队列没有消息时，next（）会运行nativePollOnce（），它会等待，休眠，把子线程停掉，让它等待，如果线程休眠，那它就会一直占用内存和资源，就会发生内存泄漏，通过messagequeue调用quitsafely（）方法，quitsafely（）又会调用quit（）方法，其中会清空消息队列的所有消息，然后nativeWake（），执行next（）方法中nativePollOnce（）【睡眠】后面的代码，然后就能够结束掉for循环，然后就可以退出线程，这时线程所有的上下文也会退出，jvm可达性分析不可达了就会回收线程。
+
+但在主线程中时不会退出线程的，也绝对不能退出线程。
+
+
+
+messagequeue是在looper的loop（）方法中的构造函数中被初始化的，且message queue是被final修饰的，一旦被初始化是不能修改的。
+
+在handler中也是先获取到looper，然后再获取到looper.message queue。这就是looper和messagequeue的一一对应，而且handler里面同一个线程里面使用的是同一个messagequeue。所以enqueuemessage（）方法中synchronized（this）的this锁的是整个线程，从而保证线程安全。所以每一个handler去添加消息是都会收到这个锁的限制。
+
+
+
+Activity的OnPause（）方法的流程：
+
+![image-20211030145922974](C:\Users\lenovo\AppData\Roaming\Typora\typora-user-images\image-20211030145922974.png)
+
+
+
+
+
+消息队列中存和取消息的过程：
+
+![image-20211101095239429](C:\Users\lenovo\AppData\Roaming\Typora\typora-user-images\image-20211101095239429.png)
+
+messsagequeue的next（）方法中的synchronized锁是为了与enqueuemessage（）方法中的入队列的这个行为相互匹配，相互协调，不然一边存一边又取，可能会造成混乱。
+
+
+
+我们使用Message是应该如何创建它？
+
+创建消息我们一般用obtainmessage（），当然new message也是可以运行的。
+
+但是通过new message会在造成STW和内存溢出OOM。
+
+STW问题：stop the world ，虚拟机在执行GC时会让所有的线程停止工作。（卡顿）
+
+而通过obtainmessage（）可以解决这些问题，通过一个message池子，然后里卖弄的message为空，要用到是直接取就好了，且是static修饰的，所以不会有频繁GC的情况发生。 
+
+
+
+recyclrview中是享元模式，其中oncreateview（）指挥调用3-5次，大量调用的是bindview（），享元模式可以用来避免卡顿，避免OOM，例如炒股实时list信息显示。 
+
+
+
+
+
+ANR原理：
+
+每个事件都是一个MSG（activity,service....) —》handler
+
+耗时超过限制就会发生ANR，ANR再在handler中进行处理
+
+Msg—》dialog
+
+意味着，主线程没事做了，休息
+
+
+
+![image-20211103203610557](C:\Users\lenovo\AppData\Roaming\Typora\typora-user-images\image-20211103203610557.png)
+
+![image-20211103203735477](C:\Users\lenovo\AppData\Roaming\Typora\typora-user-images\image-20211103203735477.png)
+
+所以ANR更looper死循环以及消息队列中无消息是没有关系的！
+
+
+
+![image-20211104192700431](C:\Users\lenovo\AppData\Roaming\Typora\typora-user-images\image-20211104192700431.png)
+
+
+
+Handler  looper   死循环  心跳机制
+
+
+
+常用于UI更新
+
+子线程
+
+handler.sendMsg(MSG) -> MessageQueue.enqueueMessage()  入队列
+
+
+
+​           looper.loop()  -> MessageQueue.next()  ->  handler.handleMessage(MSG)
+
+​                                                                        主线程
